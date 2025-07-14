@@ -1,0 +1,786 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib as mpl  # 新增
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import joblib
+import os
+import time
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+import io
+import base64
+import tempfile
+from datetime import datetime
+
+# 设置matplotlib中文字体支持 - 解决图表中文显示方框问题
+def set_chinese_font():
+    try:
+        # Windows常用中文字体
+        font_names = [
+            'SimHei',   # 黑体
+            'Microsoft YaHei', # 微软雅黑
+            'KaiTi',    # 楷体
+            'FangSong', # 仿宋
+            'STSong',   # 华文宋体
+            'STKaiti',  # 华文楷体
+            'LiHei Pro' # 苹果丽黑 (Mac)
+        ]
+        
+        # 检查系统可用字体
+        available_fonts = [font.name for font in mpl.font_manager.fontManager.ttflist]
+        
+        # 寻找第一个可用的中文字体
+        for font_name in font_names:
+            if font_name in available_fonts:
+                mpl.rcParams['font.sans-serif'] = [font_name]
+                mpl.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+                print(f"成功设置中文字体: {font_name}")
+                return True
+        
+        # 如果未找到指定中文字体，尝试使用默认设置
+        mpl.rcParams['font.sans-serif'] = ['sans-serif']
+        print("未找到系统中文字体，使用默认字体")
+        return False
+    
+    except Exception as e:
+        print(f"设置中文字体时出错: {str(e)}")
+        return False
+
+# 执行字体设置
+set_chinese_font()
+
+# 设置页面配置
+st.set_page_config(
+    page_title="结直肠癌生存时间预测平台",
+    page_icon="⏳",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# 自定义CSS样式
+st.markdown("""
+    <style>
+    /* 保持原有CSS不变 */
+    .header-style {
+        font-size: 20px;
+        font-weight: bold;
+        color: #2c3e50;
+    }
+    .highlight {
+        background-color: #f8f9fa;
+        border-radius: 5px;
+        padding: 10px;
+        margin-bottom: 10px;
+    }
+    .risk-high {
+        background-color: #ffcccc;
+        padding: 10px;
+        border-radius: 5px;
+    }
+    .risk-low {
+        background-color: #ccffcc;
+        padding: 10px;
+        border-radius: 5px;
+    }
+    .sidebar-section {
+        margin-bottom: 20px;
+    }
+    .st-bd {
+        padding: 10px;
+        border: 1px solid #e1e4e8;
+        border-radius: 5px;
+    }
+    .feature-importance {
+        max-height: 400px;
+        overflow-y: auto;
+    }
+    .prediction-result {
+        background-color: #e6f7ff;
+        padding: 15px;
+        border-radius: 5px;
+        margin-top: 15px;
+    }
+    .metric-card {
+        background-color: #f0f2f6;
+        border-radius: 10px;
+        padding: 15px;
+        margin-bottom: 15px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .tab-content {
+        padding: 20px;
+        border: 1px solid #e1e4e8;
+        border-radius: 10px;
+        margin-top: 15px;
+    }
+    /* 新增：表格中文字体 */
+    .stDataFrame table {
+        font-family: 'Microsoft YaHei', 'SimHei', sans-serif !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# ======================
+# 数据处理与模型训练
+# ======================
+def generate_sample_data():
+    """生成结直肠癌示例数据集"""
+    np.random.seed(42)
+    size = 500  # 中等大小的数据集
+    
+    # 创建基础特征
+    df = pd.DataFrame({
+        '患者ID': range(1, size+1),
+        '登记日期': [datetime.now().strftime("%Y-%m-%d") for _ in range(size)],
+        '年龄': np.random.randint(30, 85, size),
+        '性别': np.random.choice(['男', '女'], size, p=[0.55, 0.45]),
+        'TNM分期': np.random.choice(['I', 'II', 'III', 'IV'], size, p=[0.15, 0.3, 0.4, 0.15]),
+        'CEA水平(ng/mL)': np.round(np.random.uniform(0.5, 100, size), 1),
+        'MSI状态': np.random.choice(['MSS', 'MSI-L', 'MSI-H'], size, p=[0.7, 0.2, 0.1]),
+        'KRAS突变': np.random.choice(['阳性', '阴性'], size, p=[0.45, 0.55]),
+        'BRAF突变': np.random.choice(['阳性', '阴性'], size, p=[0.15, 0.85]),
+        '肿瘤位置': np.random.choice(['升结肠', '横结肠', '降结肠', '乙状结肠', '直肠'], size),
+        '治疗方案': np.random.choice(['FOLFOX', 'CAPOX', 'FOLFIRI', '免疫治疗'], size),
+        '治疗响应': np.random.choice(['完全缓解', '部分缓解', '疾病稳定', '疾病进展'], size),
+        '生存状态': np.random.choice(['存活', '死亡'], size, p=[0.65, 0.35]),
+        '生存时间(月)': np.random.exponential(24, size).astype(int) + np.random.randint(0, 60, size)
+    })
+    
+    # 添加生存时间与特征的相关性
+    df.loc[df['TNM分期'] == 'I', '生存时间(月)'] += np.random.randint(24, 60, len(df[df['TNM分期'] == 'I']))
+    df.loc[df['TNM分期'] == 'II', '生存时间(月)'] += np.random.randint(12, 36, len(df[df['TNM分期'] == 'II']))
+    df.loc[df['TNM分期'] == 'III', '生存时间(月)'] += np.random.randint(6, 24, len(df[df['TNM分期'] == 'III']))
+    df.loc[df['TNM分期'] == 'IV', '生存时间(月)'] += np.random.randint(0, 12, len(df[df['TNM分期'] == 'IV']))
+    
+    df.loc[df['MSI状态'] == 'MSI-H', '生存时间(月)'] += np.random.randint(12, 36, len(df[df['MSI状态'] == 'MSI-H']))
+    
+    return df
+
+class SurvivalTimeModel:
+    """生存时间预测模型"""
+    def __init__(self):
+        self.model = None
+        self.scaler = None
+        self.encoders = {}
+        self.features = ['年龄', '性别', 'TNM分期', 'CEA水平(ng/mL)', 'MSI状态', 'KRAS突变']
+        self.target = '生存时间(月)'
+        self.trained = False
+        self.train_metrics = {}
+        self.category_mapping = {
+            '性别': {'男': 0, '女': 1, 'male': 0, 'female': 1},
+            'TNM分期': {'I': 0, 'II': 1, 'III': 2, 'IV': 3},
+            'MSI状态': {'MSS': 0, 'MSI-L': 1, 'MSI-H': 2},
+            'KRAS突变': {'阳性': 1, '阴性': 0, 'positive': 1, 'negative': 0}
+        }
+    
+    def preprocess_data(self, df):
+        """数据预处理（确保兼容性）"""
+        processed = df.copy()
+        
+        # 处理缺失值
+        for col in self.features + [self.target]:
+            if col in processed.columns and processed[col].isnull().any():
+                if processed[col].dtype == 'object':
+                    processed[col].fillna('未知', inplace=True)
+                else:
+                    processed[col].fillna(processed[col].median(), inplace=True)
+        
+        # 统一TNM分期格式
+        if 'TNM分期' in processed.columns:
+            processed['TNM分期'] = processed['TNM分期'].str.replace('Stage', '').str.strip()
+            processed['TNM分期'] = processed['TNM分期'].str.replace('--', '未知')
+        
+        # 转换分类变量为数值
+        for col in ['性别', 'TNM分期', 'MSI状态', 'KRAS突变']:
+            if col in processed.columns:
+                # 使用统一的映射转换
+                processed[col] = processed[col].map(self.category_mapping[col]).fillna(-1)
+        
+        # 标准化数值特征
+        numeric_cols = ['年龄', 'CEA水平(ng/mL)']
+        if self.scaler is None:
+            self.scaler = StandardScaler()
+            self.scaler.fit(processed[numeric_cols])
+        processed[numeric_cols] = self.scaler.transform(processed[numeric_cols])
+        
+        return processed[self.features], processed[self.target] if self.target in processed.columns else None
+    
+    def train(self, df):
+        """训练模型（包含错误处理）"""
+        try:
+            X, y = self.preprocess_data(df)
+            
+            # 检查是否有足够的数据
+            if len(y) < 10:
+                return False, "错误：数据量不足，需要至少10个样本"
+            
+            # 划分训练测试集
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42
+            )
+            
+            # 训练随机森林回归模型
+            self.model = RandomForestRegressor(
+                n_estimators=100,  # 适度大小
+                max_depth=5,      # 防止过拟合
+                random_state=42,
+                n_jobs=-1
+            )
+            self.model.fit(X_train, y_train)
+            
+            # 评估模型
+            y_pred = self.model.predict(X_test)
+            
+            # 计算评估指标
+            mae = mean_absolute_error(y_test, y_pred)
+            r2 = r2_score(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            
+            # 保存评估指标
+            self.train_metrics = {
+                'mae': mae,
+                'r2': r2,
+                'rmse': rmse,
+                'y_test': y_test,
+                'y_pred': y_pred
+            }
+            
+            self.trained = True
+            return True, f"模型训练成功！MAE: {mae:.1f}个月, R²: {r2:.2f}"
+        except Exception as e:
+            return False, f"训练过程中出错: {str(e)}"
+    
+    def predict(self, patient_data):
+        """预测单个患者生存时间（健壮版）"""
+        if not self.trained or self.model is None:
+            return None, "模型尚未训练"
+        
+        try:
+            # 转换为DataFrame
+            patient_df = pd.DataFrame([patient_data])
+            
+            # 应用相同的预处理
+            for col in ['性别', 'TNM分期', 'MSI状态', 'KRAS突变']:
+                if col in patient_df.columns:
+                    # 使用统一的映射转换
+                    patient_df[col] = patient_df[col].map(self.category_mapping[col]).fillna(-1)
+            
+            # 标准化数值特征
+            numeric_cols = ['年龄', 'CEA水平(ng/mL)']
+            if self.scaler:
+                patient_df[numeric_cols] = self.scaler.transform(patient_df[numeric_cols])
+            
+            # 预测
+            prediction = self.model.predict(patient_df[self.features])[0]
+            
+            return prediction, "预测成功"
+        except Exception as e:
+            return None, f"预测时出错: {str(e)}"
+
+# ======================
+# 可视化函数
+# ======================
+def plot_survival_curve(df):
+    """绘制生存曲线"""
+    if '生存时间(月)' not in df.columns or '生存状态' not in df.columns:
+        return plt.figure()
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # 按TNM分期分组
+    for stage in sorted(df['TNM分期'].dropna().unique(), key=lambda x: str(x)):
+        stage_df = df[df['TNM分期'] == stage]
+        if len(stage_df) == 0:
+            continue
+        survival_data = []
+        max_time = min(120, df['生存时间(月)'].max())  # 限制最大时间
+        for t in range(0, int(max_time)+10, 10):
+            survived = ((stage_df['生存时间(月)'] >= t) & (stage_df['生存状态'] == '存活')).mean()
+            survival_data.append((t, survived))
+        
+        times, probs = zip(*survival_data)
+        ax.plot(times, probs, label=f'{stage}期', linewidth=2)
+    
+    # 使用中文字体
+    ax.set_title('不同TNM分期患者的生存曲线')
+    ax.set_xlabel('时间 (月)')
+    ax.set_ylabel('生存率')
+    ax.legend(title='TNM分期', prop={'family': 'SimHei'})
+    ax.grid(True)
+    return fig
+
+def plot_feature_distribution(df, feature):
+    """绘制特征分布图"""
+    if feature not in df.columns:
+        return plt.figure()
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    if df[feature].dtype == 'object':
+        # 分类变量
+        value_counts = df[feature].value_counts()
+        sns.barplot(x=value_counts.index, y=value_counts.values, ax=ax)
+        # 使用中文字体
+        ax.set_title(f'{feature}分布')
+        ax.set_xlabel(feature)
+        ax.set_ylabel('计数')
+        plt.xticks(rotation=45)
+    else:
+        # 数值变量
+        sns.histplot(df[feature], kde=True, ax=ax)
+        # 使用中文字体
+        ax.set_title(f'{feature}分布')
+        ax.set_xlabel(feature)
+        ax.set_ylabel('频率')
+    
+    # 设置字体
+    for item in ([ax.title, ax.xaxis.label, ax.yaxis.label] +
+                 ax.get_xticklabels() + ax.get_yticklabels()):
+        item.set_fontproperties('SimHei')  # 使用已设置的中文字体
+    
+    return fig
+
+def plot_feature_correlation(df, feature1, feature2):
+    """绘制两个特征的相关性"""
+    if feature1 not in df.columns or feature2 not in df.columns:
+        return plt.figure()
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    if df[feature1].dtype == 'object' or df[feature2].dtype == 'object':
+        # 至少有一个是分类变量
+        sns.boxplot(x=feature1, y=feature2, data=df, ax=ax)
+        # 使用中文字体
+        ax.set_title(f'{feature1} vs {feature2}')
+    else:
+        # 两个都是数值变量
+        sns.scatterplot(x=feature1, y=feature2, data=df, alpha=0.6, ax=ax)
+        # 使用中文字体
+        ax.set_title(f'{feature1} vs {feature2} 散点图')
+    
+    # 设置字体
+    ax.set_xlabel(feature1)
+    ax.set_ylabel(feature2)
+    for item in ([ax.title, ax.xaxis.label, ax.yaxis.label] +
+                 ax.get_xticklabels() + ax.get_yticklabels()):
+        item.set_fontproperties('SimHei')  # 使用已设置的中文字体
+    
+    plt.xticks(rotation=45)
+    return fig
+
+def plot_prediction_vs_actual(y_test, y_pred):
+    """绘制预测值 vs 实际值"""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(y_test, y_pred, alpha=0.6)
+    ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'k--', lw=2)
+    
+    # 使用中文字体
+    ax.set_xlabel('实际生存时间 (月)')
+    ax.set_ylabel('预测生存时间 (月)')
+    ax.set_title('预测值 vs 实际值')
+    
+    # 设置字体
+    for item in ([ax.title, ax.xaxis.label, ax.yaxis.label]):
+        item.set_fontproperties('SimHei')
+    
+    return fig
+
+def plot_residuals(y_test, y_pred):
+    """绘制残差图"""
+    residuals = y_test - y_pred
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(y_pred, residuals, alpha=0.6)
+    ax.axhline(y=0, color='r', linestyle='-')
+    
+    # 使用中文字体
+    ax.set_xlabel('预测生存时间 (月)')
+    ax.set_ylabel('残差')
+    ax.set_title('残差分析')
+    
+    # 设置字体
+    for item in ([ax.title, ax.xaxis.label, ax.yaxis.label]):
+        item.set_fontproperties('SimHei')
+    
+    return fig
+
+def plot_feature_importance(model, feature_names):
+    """绘制特征重要性"""
+    if model.model is None:
+        return plt.figure()
+    
+    try:
+        importances = model.model.feature_importances_
+        indices = np.argsort(importances)[::-1]
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # 使用中文字体
+        ax.set_title("特征重要性")
+        ax.set_xlabel("特征")
+        ax.set_ylabel("重要性")
+        
+        # 创建条形图
+        bars = ax.bar(range(len(importances)), importances[indices], align="center")
+        ax.set_xticks(range(len(importances)))
+        
+        # 设置特征名称
+        ax.set_xticklabels([feature_names[i] for i in indices], rotation=45)
+        
+        # 设置字体
+        for item in ([ax.title, ax.xaxis.label, ax.yaxis.label] + 
+                     ax.get_xticklabels() + ax.get_yticklabels()):
+            item.set_fontproperties('SimHei')
+        
+        return fig
+    except Exception:
+        return plt.figure()
+
+# ======================
+# 数据探索分析
+# ======================
+def perform_eda(df):
+    """执行探索性数据分析"""
+    eda_results = {}
+    
+    # 基本统计信息
+    eda_results['shape'] = df.shape
+    eda_results['dtypes'] = df.dtypes
+    eda_results['describe'] = df.describe(include='all')
+    
+    # 缺失值分析
+    eda_results['missing_values'] = df.isnull().sum()
+    
+    # 目标变量分布
+    if '生存时间(月)' in df.columns:
+        eda_results['target_distribution'] = df['生存时间(月)'].describe()
+    
+    return eda_results
+
+# ======================
+# Streamlit应用界面
+# ======================
+def main():
+    st.title("⏳ 结直肠癌生存时间预测平台")
+    st.markdown("> 基于多维度临床数据的生存时间预测工具")
+    
+    # 初始化会话状态
+    if 'survival_model' not in st.session_state:
+        st.session_state.survival_model = SurvivalTimeModel()
+    if 'df' not in st.session_state:
+        st.session_state.df = generate_sample_data()
+    
+    # 侧边栏控制面板
+    with st.sidebar:
+        st.header("📂 数据管理")
+        
+        # 数据源选择
+        data_source = st.radio("选择数据源", ["示例数据", "上传CSV文件"])
+        
+        if data_source == "上传CSV文件":
+            uploaded_file = st.file_uploader("上传结直肠癌数据集", type="csv")
+            if uploaded_file:
+                df = pd.read_csv(uploaded_file)
+                # 确保生存时间列存在
+                if '生存时间(月)' not in df.columns:
+                    st.warning("数据中缺少'生存时间(月)'列，将使用示例数据")
+                    st.session_state.df = generate_sample_data()
+                else:
+                    # 确保包含所有必要特征
+                    required_features = ['年龄', '性别', 'TNM分期', 'CEA水平(ng/mL)', 'MSI状态', 'KRAS突变']
+                    missing_features = [feat for feat in required_features if feat not in df.columns]
+                    
+                    if missing_features:
+                        st.warning(f"数据中缺少以下特征: {', '.join(missing_features)}，将使用示例数据")
+                        st.session_state.df = generate_sample_data()
+                    else:
+                        st.session_state.df = df
+                        st.success("数据上传成功！")
+            else:
+                st.info("请上传CSV文件")
+        else:
+            dataset_size = st.slider("数据集大小", 100, 1000, 500, step=100)
+            st.session_state.df = generate_sample_data()
+            st.info(f"已加载示例数据 ({dataset_size}行)")
+        
+        df = st.session_state.df
+        
+        # 数据筛选
+        st.header("🔍 数据筛选")
+        
+        if 'TNM分期' in df.columns:
+            tnm_options = df['TNM分期'].dropna().unique()
+            if len(tnm_options) > 0:
+                selected_stages = st.multiselect("TNM分期筛选", tnm_options, tnm_options[:min(2, len(tnm_options))])
+            else:
+                selected_stages = []
+                st.warning("TNM分期数据不足")
+        else:
+            selected_stages = []
+            st.warning("数据中缺少TNM分期")
+        
+        if 'MSI状态' in df.columns:
+            msi_options = list(df['MSI状态'].dropna().unique()) + ['全部']
+            msi_filter = st.selectbox("MSI状态筛选", msi_options, index=len(msi_options)-1)
+        else:
+            msi_filter = '全部'
+            st.warning("数据中缺少MSI状态")
+        
+        if '年龄' in df.columns:
+            age_min, age_max = int(df['年龄'].min()), int(df['年龄'].max())
+            if age_min < age_max:
+                age_range = st.slider("年龄范围", age_min, age_max, (max(50, age_min), min(70, age_max)))
+            else:
+                age_range = (50, 70)
+                st.warning("年龄数据异常，使用默认范围")
+        else:
+            age_range = (50, 70)
+            st.warning("数据中缺少年龄信息")
+        
+        # 模型训练
+        st.header("🤖 机器学习模型")
+        if st.button("训练生存时间预测模型", key='train_btn'):
+            with st.spinner("训练模型中..."):
+                # 使用正确的模型名称
+                success, message = st.session_state.survival_model.train(st.session_state.df)
+                if success:
+                    st.success(message)
+                    st.info(f"模型评估结果：MAE {st.session_state.survival_model.train_metrics['mae']:.1f}个月, R² {st.session_state.survival_model.train_metrics['r2']:.2f}")
+                else:
+                    st.error(message)
+        
+        # 模型保存与加载
+        st.header("💾 模型管理")
+        if st.session_state.survival_model.trained:
+            if st.button("保存模型"):
+                model_path = os.path.join(tempfile.gettempdir(), "crc_survival_model.joblib")
+                joblib.dump(st.session_state.survival_model, model_path)
+                st.success(f"模型已保存到: {model_path}")
+        
+        uploaded_model = st.file_uploader("上传训练好的模型", type="joblib")
+        if uploaded_model:
+            try:
+                st.session_state.survival_model = joblib.load(uploaded_model)
+                st.success("模型加载成功！")
+            except Exception as e:
+                st.error(f"模型加载失败: {str(e)}")
+    
+    # 主内容区域
+    df = st.session_state.df
+    
+    # 显示数据摘要
+    st.subheader("📋 当前数据集摘要")
+    st.write(f"数据集大小: {df.shape[0]} 行, {df.shape[1]} 列")
+    
+    # 应用筛选条件
+    filtered_df = df.copy()
+    if 'TNM分期' in filtered_df.columns and len(selected_stages) > 0:
+        filtered_df = filtered_df[filtered_df['TNM分期'].isin(selected_stages)]
+    if msi_filter != '全部' and 'MSI状态' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['MSI状态'] == msi_filter]
+    if '年龄' in filtered_df.columns:
+        filtered_df = filtered_df[
+            (filtered_df['年龄'] >= age_range[0]) & 
+            (filtered_df['年龄'] <= age_range[1])
+        ]
+    
+    # ======================
+    # 数据探索分析部分
+    # ======================
+    st.header("🔍 数据探索分析")
+    
+    with st.expander("数据集概览"):
+        st.subheader("基本统计信息")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("数据类型分布:")
+            st.write(df.dtypes.value_counts().to_frame().rename(columns={0: '计数'}))
+        
+        with col2:
+            if '生存时间(月)' in df.columns:
+                st.write("生存时间分布:")
+                fig = px.histogram(df, x='生存时间(月)', nbins=30)
+                st.plotly_chart(fig, use_container_width=True)
+    
+    with st.expander("缺失值分析"):
+        missing_values = df.isnull().sum()
+        missing_values = missing_values[missing_values > 0]
+        if len(missing_values) > 0:
+            st.write("缺失值统计:")
+            st.bar_chart(missing_values)
+        else:
+            st.success("数据中没有缺失值")
+    
+    with st.expander("特征分布分析"):
+        col1, col2 = st.columns(2)
+        with col1:
+            feature1 = st.selectbox("选择第一个特征", df.columns, index=0)
+            fig1 = plot_feature_distribution(df, feature1)
+            st.pyplot(fig1)
+        
+        with col2:
+            feature2 = st.selectbox("选择第二个特征", df.columns, index=1)
+            fig2 = plot_feature_distribution(df, feature2)
+            st.pyplot(fig2)
+    
+    with st.expander("特征相关性分析"):
+        col1, col2 = st.columns(2)
+        with col1:
+            corr_feature1 = st.selectbox("选择特征1", df.columns, index=0)
+        with col2:
+            corr_feature2 = st.selectbox("选择特征2", df.columns, index=1)
+        
+        fig_corr = plot_feature_correlation(df, corr_feature1, corr_feature2)
+        st.pyplot(fig_corr)
+    
+    # ======================
+    # 数据概览部分
+    # ======================
+    st.header("📊 数据集概览")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("总病例数", len(df))
+    col2.metric("筛选后病例", len(filtered_df))
+    
+    if '生存时间(月)' in df.columns:
+        avg_survival = filtered_df['生存时间(月)'].mean()
+        col3.metric("平均生存时间", f"{avg_survival:.1f} 个月")
+    
+    if 'CEA水平(ng/mL)' in df.columns:
+        avg_cea = filtered_df['CEA水平(ng/mL)'].mean()
+        col4.metric("平均CEA水平", f"{avg_cea:.1f} ng/mL")
+    
+    # 数据表格
+    st.subheader("📋 临床数据详情")
+    st.dataframe(filtered_df.head(50), height=300, use_container_width=True)
+    
+    # ======================
+    # 高级可视化部分
+    # ======================
+    st.header("📈 高级可视化分析")
+    
+    tab1, tab2, tab3 = st.tabs(["生存分析", "特征关系", "模型评估"])
+    
+    with tab1:
+        st.subheader("生存分析")
+        if '生存时间(月)' in filtered_df.columns and '生存状态' in filtered_df.columns:
+            fig_survival = plot_survival_curve(filtered_df)
+            st.pyplot(fig_survival)
+        else:
+            st.warning("缺少生存分析所需数据")
+    
+    with tab2:
+        st.subheader("特征关系分析")
+        col1, col2 = st.columns(2)
+        with col1:
+            x_feature = st.selectbox("X轴特征", df.columns, index=0, key='x_feature')
+        with col2:
+            y_feature = st.selectbox("Y轴特征", df.columns, index=1, key='y_feature')
+        
+        if x_feature and y_feature:
+            fig_rel = plot_feature_correlation(filtered_df, x_feature, y_feature)
+            st.pyplot(fig_rel)
+    
+    with tab3:
+        st.subheader("模型评估")
+        if st.session_state.survival_model.trained:
+            # 预测值 vs 实际值
+            st.write("### 预测值 vs 实际值")
+            y_test = st.session_state.survival_model.train_metrics.get('y_test', None)
+            y_pred = st.session_state.survival_model.train_metrics.get('y_pred', None)
+            if y_test is not None and y_pred is not None:
+                fig_pred = plot_prediction_vs_actual(y_test, y_pred)
+                st.pyplot(fig_pred)
+            
+            # 残差图
+            st.write("### 残差分析")
+            if y_test is not None and y_pred is not None:
+                fig_res = plot_residuals(y_test, y_pred)
+                st.pyplot(fig_res)
+            
+            # 特征重要性
+            st.write("### 特征重要性")
+            fig_imp = plot_feature_importance(st.session_state.survival_model, st.session_state.survival_model.features)
+            st.pyplot(fig_imp)
+            
+            # 显示评估指标
+            st.write("### 模型评估指标")
+            metrics = st.session_state.survival_model.train_metrics
+            col1, col2, col3 = st.columns(3)
+            col1.metric("平均绝对误差 (MAE)", f"{metrics['mae']:.1f} 个月")
+            col2.metric("均方根误差 (RMSE)", f"{metrics['rmse']:.1f} 个月")
+            col3.metric("R² 分数", f"{metrics['r2']:.2f}")
+        else:
+            st.warning("请先训练模型")
+    
+    # ======================
+    # 单患者生存时间预测
+    # ======================
+    st.header("🔮 患者生存时间预测")
+    
+    with st.form("prediction_form"):
+        st.subheader("输入患者特征进行生存时间预测")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            age = st.number_input("年龄", min_value=30, max_value=85, value=60)
+            gender = st.selectbox("性别", ["男", "女", "male", "female"])
+            tnm_options = ['I', 'II', 'III', 'IV']
+            tnm_stage = st.selectbox("TNM分期", tnm_options, index=2)
+        with col2:
+            cea_level = st.number_input("CEA水平(ng/mL)", min_value=0.0, max_value=100.0, value=15.0)
+            msi_status = st.selectbox("MSI状态", ["MSS", "MSI-L", "MSI-H"])
+            kras_mutation = st.selectbox("KRAS突变", ["阳性", "阴性", "positive", "negative"])
+        
+        predict_btn = st.form_submit_button("预测生存时间")
+        
+        if predict_btn:
+            patient_data = {
+                '年龄': age,
+                '性别': gender,
+                'TNM分期': tnm_stage,
+                'CEA水平(ng/mL)': cea_level,   
+                'MSI状态': msi_status,
+                'KRAS突变': kras_mutation
+            }
+            
+            prediction, message = st.session_state.survival_model.predict(patient_data)
+            
+            if prediction is not None:
+                # 将预测结果转换为年
+                years = prediction / 12
+                
+                st.markdown(f"""
+                <div class="prediction-result">
+                    <h3>预测生存时间: {prediction:.1f} 个月 ({years:.1f} 年)</h3>
+                    <p><b>临床建议</b>:</p>
+                    <ul>
+                        <li>根据预测结果制定个体化随访计划</li>
+                        <li>结合临床分期和分子标志物调整治疗方案</li>
+                        <li>定期监测CEA水平和影像学变化</li>
+                        <li>提供营养支持和心理辅导</li>
+                    </ul>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # 解释预测结果
+                st.subheader("预测结果解释")
+                if prediction < 24:
+                    st.warning("预测生存时间较短（<2年），建议考虑强化治疗方案和姑息治疗")
+                elif prediction < 60:
+                    st.info("预测生存时间中等（2-5年），建议定期随访和积极治疗")
+                else:
+                    st.success("预测生存时间较长（>5年），预后较好，建议维持当前治疗方案")
+            else:
+                st.warning(message)
+
+# ======================
+# 运行应用
+# ======================
+if __name__ == "__main__":
+    main()
